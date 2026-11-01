@@ -3,6 +3,8 @@ import logging
 import os
 import sys
 import stat
+import hashlib
+import tempfile
 from typing import List, Dict, Tuple
 from rich.console import Console
 from rich.table import Table
@@ -41,13 +43,15 @@ class PermissionRiskVisualizer:
         """
         self.permissions_data = {}  # Reset data for each run
 
-        for root, _, files in os.walk(self.root_path):
-            for filename in files:
-                filepath = os.path.join(root, filename)
+        for root, dirs, files in os.walk(self.root_path):
+            entries = [os.path.join(root, name) for name in dirs]
+            entries += [os.path.join(root, name) for name in files]
+            for filepath in entries:
                 try:
                     stat_info = os.stat(filepath)
                     self.permissions_data[filepath] = {
                         "mode": stat.filemode(stat_info.st_mode),
+                        "mode_bits": stat_info.st_mode,
                         "owner": str(stat_info.st_uid),  # Convert uid to string
                         "group": str(stat_info.st_gid),  # Convert gid to string
                     }
@@ -64,16 +68,16 @@ class PermissionRiskVisualizer:
         risks: List[Tuple[str, str]] = []
 
         for filepath, data in self.permissions_data.items():
-            mode = data["mode"]
-
-            # Check for overly permissive files (e.g., world-writable files)
-            if mode.startswith("-") and mode.endswith("rwxrwxrwx"):
-                risks.append((filepath, "World-writable file detected."))
-            elif mode.startswith("-") and mode.endswith("rw-rw-rw-"):
-                risks.append((filepath, "World-readable and writeable file detected."))
-
-            # Add more sophisticated risk analysis logic here as needed
-            # (e.g., check for setuid/setgid bits, excessive permissions for specific users)
+            bits = data.get("mode_bits", 0)
+            kind = "directory" if data["mode"].startswith("d") else "file"
+            if bits & stat.S_ISUID:
+                risks.append((filepath, f"Setuid {kind} detected."))
+            if bits & stat.S_ISGID:
+                risks.append((filepath, f"Setgid {kind} detected."))
+            if bits & stat.S_IWOTH:
+                risks.append((filepath, f"World-writable {kind} detected."))
+            if bits & stat.S_IWGRP:
+                risks.append((filepath, f"Group-writable {kind} detected."))
 
         return risks
 
@@ -91,60 +95,71 @@ class PermissionRiskVisualizer:
         dot_graph = "digraph PermissionRisks {\n"
         dot_graph += "  node [shape=box];\n"  # Style for nodes
 
-        for filepath, risk_description in risks:
-            # Sanitize filepath for DOT format (replace special characters)
-            node_name = filepath.replace("/", "_").replace(".", "_").replace("\\", "_")  # Handling Windows paths too
+        seen_owners = set()
+        for index, (filepath, risk_description) in enumerate(risks):
+            digest = hashlib.sha1(filepath.encode("utf-8")).hexdigest()[:10]
+            node_name = f"risk_{index}_{digest}"
             dot_graph += f'  "{node_name}" [label="{filepath}\\nRisk: {risk_description}"];\n'
-
-        # Add edges if needed (e.g., to show ownership relationships) - Not implemented in this basic example
-        # For example, if user A owns file B, you could add an edge:
-        # dot_graph += f'  "{user_A_node}" -> "{file_B_node}";\n'
+            owner = self.permissions_data.get(filepath, {}).get("owner", "")
+            if owner:
+                owner_node = f"owner_{owner}"
+                if owner_node not in seen_owners:
+                    seen_owners.add(owner_node)
+                    dot_graph += f'  "{owner_node}" [label="owner uid {owner}", shape=ellipse];\n'
+                dot_graph += f'  "{owner_node}" -> "{node_name}" [label="owns"];\n'
 
         dot_graph += "}\n"
         return dot_graph
 
-    def output_graph(self, dot_graph: str) -> None:
+    def output_graph(self, dot_graph: str) -> bool:
         """
         Outputs the graph to the specified file, converting to PNG if necessary.
         Requires graphviz to be installed to convert to PNG.
 
         Args:
             dot_graph: The graph in DOT format.
+
+        Returns:
+            True when the output file was created, False otherwise.
         """
+        tmp_path = None
         try:
-            with open("temp_graph.dot", "w") as f:
+            fd, tmp_path = tempfile.mkstemp(prefix="temp_graph_", suffix=".dot", dir=".")
+            with os.fdopen(fd, "w") as f:
                 f.write(dot_graph)
 
             if self.output_format == "png":
-                # Convert DOT to PNG using graphviz
                 try:
                     import subprocess
                     subprocess.run(
-                        ["dot", "-Tpng", "temp_graph.dot", "-o", self.output_file],
+                        ["dot", "-Tpng", tmp_path, "-o", self.output_file],
                         check=True,
                         capture_output=True,
                         text=True,
                     )
                     logging.info(f"Graph saved to {self.output_file} (PNG format).")
                 except FileNotFoundError:
-                    self.console.print_exception()
                     logging.error("Graphviz 'dot' command not found. Please install graphviz to generate PNG output.")
+                    return False
                 except subprocess.CalledProcessError as e:
-                      logging.error(f"Error converting DOT to PNG: {e.stderr}")
-                      self.console.print_exception()
+                    logging.error(f"Error converting DOT to PNG: {e.stderr}")
+                    return False
 
             elif self.output_format == "dot":
-                # Save as DOT format directly
-                os.rename("temp_graph.dot", self.output_file) #Rename to proper output file name
+                os.rename(tmp_path, self.output_file)
+                tmp_path = None
                 logging.info(f"Graph saved to {self.output_file} (DOT format).")
             else:
                 logging.error(f"Invalid output format: {self.output_format}")
+                return False
 
         except OSError as e:
             logging.error(f"Error writing graph to file: {e}")
+            return False
         finally:
-            if os.path.exists("temp_graph.dot"): #Clean up the temp file even if it fails.
-                os.remove("temp_graph.dot")
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        return os.path.exists(self.output_file)
 
     def display_risks_table(self, risks: List[Tuple[str, str]]) -> None:
         """
@@ -165,21 +180,31 @@ class PermissionRiskVisualizer:
 
         self.console.print(table)
 
-    def run(self) -> None:
+    def run(self) -> bool:
         """
         Runs the permission risk visualization process.
+
+        Returns:
+            True on success, False when nothing was scanned or no graph was created.
         """
         try:
             self.gather_permissions_data()
+            if not self.permissions_data:
+                print("No files or directories scanned. Nothing was visualized.")
+                logging.error("No files or directories scanned under the root path.")
+                return False
             risks = self.analyze_risks()
             self.display_risks_table(risks)
             dot_graph = self.generate_graph(risks)
-            self.output_graph(dot_graph)
-
+            if not self.output_graph(dot_graph):
+                print("Graph not created: the output file was not produced.")
+                return False
+            return True
 
         except Exception as e:
             logging.error(f"An unexpected error occurred: {e}")
             self.console.print_exception()
+            return False
 
 
 def setup_argparse() -> argparse.ArgumentParser:
@@ -244,6 +269,11 @@ def validate_args(args: argparse.Namespace) -> None:
     if not args.output_file:
         raise ValueError("Output file cannot be empty.")
 
+    root_resolved = os.path.realpath(args.root_path)
+    output_resolved = os.path.realpath(args.output_file)
+    if output_resolved == root_resolved or output_resolved.startswith(root_resolved + os.sep):
+        raise ValueError("Output file lies inside the scanned root and would overwrite a scanned file.")
+
     if args.output_format not in OUTPUT_FORMATS:
         raise ValueError(f"Invalid output format: {args.output_format}. Supported formats are: {', '.join(OUTPUT_FORMATS)}")
 
@@ -269,7 +299,10 @@ def main() -> None:
     visualizer = PermissionRiskVisualizer(args.root_path, args.output_file, args.output_format, console)
 
     try:
-        visualizer.run()
+        if not visualizer.run():
+            sys.exit(1)
+    except SystemExit:
+        raise
     except Exception as e:
         logging.error(f"An error occurred during execution: {e}")
         console.print_exception()
