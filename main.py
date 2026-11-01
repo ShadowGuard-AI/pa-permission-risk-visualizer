@@ -43,6 +43,8 @@ class PermissionRiskVisualizer:
         """
         self.permissions_data = {}  # Reset data for each run
 
+        # os.walk yields what sits under the root, never the root itself. The starting directory's
+        # own permissions are the one set I never check.
         for root, dirs, files in os.walk(self.root_path):
             entries = [os.path.join(root, name) for name in dirs]
             entries += [os.path.join(root, name) for name in files]
@@ -52,6 +54,8 @@ class PermissionRiskVisualizer:
                     self.permissions_data[filepath] = {
                         "mode": stat.filemode(stat_info.st_mode),
                         "mode_bits": stat_info.st_mode,
+                    # Owners stay as raw uid and gid numbers in my data. Resolving who those numbers are
+                    # is left to whoever reads the graph.
                         "owner": str(stat_info.st_uid),  # Convert uid to string
                         "group": str(stat_info.st_gid),  # Convert gid to string
                     }
@@ -65,6 +69,8 @@ class PermissionRiskVisualizer:
         Returns:
             A list of tuples, where each tuple contains the filepath and a description of the risk.
         """
+        # Only risky paths ever become graph nodes, because the graph is built from this list.
+        # A clean tree yields an empty looking picture that cannot show what was checked.
         risks: List[Tuple[str, str]] = []
 
         for filepath, data in self.permissions_data.items():
@@ -99,6 +105,8 @@ class PermissionRiskVisualizer:
         for index, (filepath, risk_description) in enumerate(risks):
             digest = hashlib.sha1(filepath.encode("utf-8")).hexdigest()[:10]
             node_name = f"risk_{index}_{digest}"
+            # Paths go into DOT labels between double quotes with no escaping. A path carrying a
+            # quote or a backslash produces a broken graph file, and nothing here notices.
             dot_graph += f'  "{node_name}" [label="{filepath}\\nRisk: {risk_description}"];\n'
             owner = self.permissions_data.get(filepath, {}).get("owner", "")
             if owner:
@@ -124,6 +132,8 @@ class PermissionRiskVisualizer:
         """
         tmp_path = None
         try:
+            # The temp file lands in the current directory, not next to the output. Run me from
+            # somewhere unwritable and PNG output fails for a reason unrelated to the scan.
             fd, tmp_path = tempfile.mkstemp(prefix="temp_graph_", suffix=".dot", dir=".")
             with os.fdopen(fd, "w") as f:
                 f.write(dot_graph)
